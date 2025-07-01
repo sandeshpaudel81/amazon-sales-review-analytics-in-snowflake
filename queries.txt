@@ -1,0 +1,239 @@
+-- Use the ACCOUNTADMIN role for full privileges
+USE ROLE ACCOUNTADMIN;
+
+-- Switch to compute warehouse
+USE WAREHOUSE COMPUTE_WH;
+
+-- Create and switch to a new database for this project
+CREATE OR REPLACE DATABASE amazon_sales_db;
+USE DATABASE amazon_sales_db;
+
+-- Create schemas for raw data and analytics/reporting
+CREATE OR REPLACE SCHEMA raw;
+CREATE OR REPLACE SCHEMA analytics;
+
+-- Define the table structure for raw Amazon sales data
+CREATE OR REPLACE TABLE raw.amazon_sales (
+  product_id STRING,
+  product_name STRING,
+  category STRING,
+  discounted_price STRING,
+  actual_price STRING,
+  discount_percentage STRING,
+  rating STRING,
+  rating_count STRING,
+  about_product STRING,
+  user_id STRING,
+  user_name STRING,
+  review_id STRING,
+  review_title STRING,
+  review_content STRING,
+  img_link STRING,
+  product_link STRING
+);
+
+-- Define CSV file format for internal stage
+CREATE OR REPLACE FILE FORMAT csv_format
+  TYPE = 'CSV'
+  FIELD_DELIMITER = ','
+  SKIP_HEADER = 1
+  FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+  NULL_IF = ('NULL', 'null');
+
+-- Create internal stage for loading data files
+CREATE OR REPLACE STAGE int_stage FILE_FORMAT = csv_format;
+
+-- List contents of the internal stage
+ls @int_stage;
+
+-- Load data from internal stage into raw.amazon_sales table
+COPY INTO raw.amazon_sales
+FROM @int_stage/amazon.csv
+FILE_FORMAT = (FORMAT_NAME = csv_format);
+
+-- Switch context to raw schema
+USE SCHEMA raw;
+
+-- Check number of loaded rows
+SELECT COUNT(*) FROM amazon_sales;
+
+-- Add new columns to hold cleaned numeric data
+ALTER TABLE amazon_sales ADD discounted_price_clean FLOAT;
+ALTER TABLE amazon_sales ADD actual_price_clean FLOAT;
+ALTER TABLE amazon_sales ADD COLUMN rating_count_clean INT;
+ALTER TABLE amazon_sales ADD COLUMN discount_percentage_clean FLOAT;
+
+-- Clean and convert price and rating columns to numeric types
+UPDATE amazon_sales SET discounted_price_clean = REGEXP_REPLACE(discounted_price, '[₹,]', '')::FLOAT;
+UPDATE amazon_sales SET actual_price_clean = REGEXP_REPLACE(actual_price, '[₹,]', '')::FLOAT;
+UPDATE amazon_sales SET rating_count_clean = REGEXP_REPLACE(rating_count, '[,]', '')::INT;
+UPDATE amazon_sales SET discount_percentage_clean = REGEXP_REPLACE(discount_percentage, '[%]', '')::FLOAT;
+
+-- Remove records with null rating count (likely bad or incomplete data)
+DELETE FROM amazon_sales WHERE rating_count_clean IS NULL;
+
+-- Analyze distribution of rating values
+SELECT rating, COUNT(*) FROM amazon_sales GROUP BY rating;
+
+-- Check malformed rating entries
+SELECT * FROM amazon_sales WHERE rating = '|';
+
+-- Confirm remaining row count after cleanup
+SELECT COUNT(*) FROM amazon_sales;
+
+-- Optional: Rollback check - see previous row count before a specific update
+SELECT COUNT(*) FROM amazon_sales BEFORE (STATEMENT => '01bd583f-3204-9489-0002-5da20001d17e');
+
+-- Add cleaned rating column
+ALTER TABLE amazon_sales ADD rating_clean FLOAT;
+
+-- Replace '|' with default 4.0 and cast to float
+UPDATE amazon_sales SET rating_clean = REGEXP_REPLACE(rating, '[|]', '4.0')::FLOAT;
+
+-- Show table structure
+SHOW COLUMNS;
+
+-- Add columns for split categories
+ALTER TABLE amazon_sales ADD category1 STRING, category2 STRING, category3 STRING;
+ALTER TABLE amazon_sales ADD category4 STRING, category5 STRING;
+
+-- Extract category hierarchy levels
+UPDATE amazon_sales 
+SET category4 = TRIM(SPLIT(category, '|')[3]),
+    category5 = TRIM(SPLIT(category, '|')[4]);
+
+-- Preview sample data
+SELECT * FROM amazon_sales LIMIT 20;
+
+-- Create fact_review table: flatten user-review arrays into one-to-one rows
+CREATE OR REPLACE TABLE analytics.review_fact AS
+WITH exploded AS (
+  SELECT 
+    product_id, 
+    user_id_table.value::string AS user_id, 
+    SPLIT(user_name, ',')[user_id_table.index]::string AS user_name,
+    SPLIT(review_id, ',')[user_id_table.index]::string AS review_id,
+    SPLIT(review_title, ',')[user_id_table.index]::string AS review_title
+  FROM raw.amazon_sales,
+    LATERAL FLATTEN(input => SPLIT(user_id, ',')) AS user_id_table
+  WHERE 
+    ARRAY_SIZE(SPLIT(user_id, ',')) = ARRAY_SIZE(SPLIT(user_name, ',')) AND
+    ARRAY_SIZE(SPLIT(user_id, ',')) = ARRAY_SIZE(SPLIT(review_id, ',')) AND
+    ARRAY_SIZE(SPLIT(user_id, ',')) = ARRAY_SIZE(SPLIT(review_title, ','))
+)
+SELECT
+  e.review_id,
+  e.review_title,
+  e.product_id,
+  e.user_id,
+  INITCAP(e.user_name) AS user_name
+FROM exploded e;
+
+-- Deduplicate review_fact to keep one unique row per review_id
+CREATE OR REPLACE TABLE analytics.fact_review AS
+SELECT *
+FROM (
+  SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY review_id ORDER BY product_id) AS rn
+  FROM analytics.review_fact
+)
+WHERE rn = 1;
+
+-- Validate deduplication
+SELECT COUNT(*) AS total_rows,
+       COUNT(DISTINCT review_id) AS distinct_reviews
+FROM analytics.fact_review;
+
+-- Create initial dim_product with cleaned values
+CREATE OR REPLACE TABLE analytics.dim_product AS
+SELECT DISTINCT
+  product_id,
+  product_name,
+  category1,
+  category2,
+  category3,
+  category4,
+  category5,
+  discounted_price_clean AS discounted_price,
+  actual_price_clean AS actual_price,
+  discount_percentage_clean AS discount_percentage,
+  rating_clean AS rating,
+  rating_count_clean AS rating_count,
+  about_product
+FROM raw.amazon_sales
+WHERE product_id IS NOT NULL;
+
+-- Check for duplicate products
+SELECT COUNT(*) AS total_products,
+       COUNT(DISTINCT product_id) AS distinct_products
+FROM analytics.dim_product;
+
+-- Identify duplicated product IDs
+SELECT DISTINCT product_id 
+FROM analytics.dim_product 
+GROUP BY product_id 
+HAVING COUNT(product_id) > 1;
+
+-- Inspect example duplicate product
+SELECT * FROM analytics.dim_product WHERE product_id = 'B08HDJ86NZ';
+
+-- Recreate dim_product keeping only the version with the highest rating_count
+CREATE OR REPLACE TABLE analytics.dim_product AS
+WITH ranked_products AS (
+  SELECT *,
+         ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY rating_count_clean DESC) AS rn
+  FROM raw.amazon_sales
+  WHERE product_id IS NOT NULL
+)
+SELECT DISTINCT
+  product_id,
+  product_name,
+  category1,
+  category2,
+  category3,
+  category4,
+  category5,
+  discounted_price_clean AS discounted_price,
+  actual_price_clean AS actual_price,
+  discount_percentage_clean AS discount_percentage,
+  rating_clean AS rating,
+  rating_count_clean AS rating_count,
+  about_product
+FROM ranked_products
+WHERE rn = 1;
+
+-- Validate deduplication of dim_product
+SELECT DISTINCT product_id 
+FROM analytics.dim_product 
+GROUP BY product_id 
+HAVING COUNT(product_id) > 1;
+
+-- Inspect cleaned product
+SELECT * FROM analytics.dim_product WHERE product_id = 'B08HDJ86NZ';
+
+-- -------------------------------
+-- ANALYTICS QUERIES
+-- -------------------------------
+
+-- Top 10 most reviewed products
+SELECT 
+    p.product_id,
+    p.product_name,
+    COUNT(r.review_id) AS total_reviews
+FROM analytics.fact_review r
+JOIN analytics.dim_product p ON r.product_id = p.product_id
+GROUP BY p.product_id, p.product_name
+ORDER BY total_reviews DESC
+LIMIT 10;
+
+
+-- Top 5 reviewers
+SELECT
+    user_id,
+    user_name,
+    count(review_id) AS total_reviews
+FROM
+    analytics.fact_review
+GROUP BY user_id, user_name
+ORDER BY total_reviews
+LIMIT 5;
