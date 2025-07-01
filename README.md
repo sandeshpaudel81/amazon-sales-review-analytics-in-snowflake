@@ -11,7 +11,7 @@ The project includes:
 
 ---
 
-## 🚀 Project Overview
+## Project Overview
 
 **Goal:** Analyze Amazon product reviews and ratings using a dimensional model in Snowflake.
 
@@ -28,20 +28,20 @@ The project includes:
 
 ---
 
-## 🧱 Schema Design
+## Schema Design
 
-### 📂 Raw Schema (`raw`)
+### Raw Schema (`raw`)
 Stores the raw ingested CSV data:
 - `raw.amazon_sales`: The source table containing all columns as strings
 
-### 📊 Analytics Schema (`analytics`)
+### Analytics Schema (`analytics`)
 Transformed data organized into a **star schema**:
 - `fact_review`: Fact table with one row per unique user review
 - `dim_product`: Dimension table with cleaned product metadata
 
 ---
 
-## 🧹 Data Cleaning Highlights
+## Data Cleaning
 
 - Removed ₹, %, and commas from price and rating fields
 - Converted data types: prices (FLOAT), ratings (FLOAT), review count (INT)
@@ -51,7 +51,7 @@ Transformed data organized into a **star schema**:
 
 ---
 
-## ⭐ Star Schema Overview
+## Star Schema 
 
 dim_product <---------- fact_review
                             |
